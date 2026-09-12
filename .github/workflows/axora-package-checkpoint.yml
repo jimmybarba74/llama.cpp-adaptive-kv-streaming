@@ -1,0 +1,226 @@
+name: AXORA Package Adaptive KV Windows CUDA Checkpoint
+
+on:
+  push:
+    branches:
+      - build/axora-windows-x64-cuda-4ba0b9b2
+    paths:
+      - .github/workflows/axora-package-checkpoint.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  SOURCE_REPOSITORY: https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming
+  SOURCE_BRANCH: feature/adaptive-kv-stream
+  SOURCE_COMMIT: 4ba0b9b25ffdafe2ec376e32a641ef229e457bae
+  CUDA_VERSION: "13.3"
+  BUILD_RUN_ID: "34681591683"
+  PACKAGE_BASENAME: AXORA_LLAMA_ADAPTIVE_KV_WINDOWS_X64_CUDA_4ba0b9b2
+
+jobs:
+  package:
+    name: Package saved CUDA build checkpoint
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Checkout pinned Adaptive KV source
+        uses: actions/checkout@v6
+        with:
+          ref: 4ba0b9b25ffdafe2ec376e32a641ef229e457bae
+          fetch-depth: 1
+
+      - name: Install CUDA Toolkit 13.3 x64
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "13.3"
+          cuda_arch: x64
+
+      - name: Download compiled runtime checkpoint
+        uses: actions/download-artifact@v7
+        with:
+          name: axora-compiled-runtime-34681591683
+          path: build/bin
+          github-token: ${{ github.token }}
+          repository: jimmybarba74/llama.cpp-adaptive-kv-streaming
+          run-id: 34681591683
+
+      - name: Package verified runtime and provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+
+          $sourceRoot = (Resolve-Path ".").Path
+          $runtimeDir = Join-Path $sourceRoot $env:PACKAGE_BASENAME
+          $zipPath = Join-Path $sourceRoot ($env:PACKAGE_BASENAME + ".zip")
+          $shaPath = $zipPath + ".sha256"
+          New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+
+          $server = Get-ChildItem (Join-Path $sourceRoot "build\bin") -Filter "llama-server.exe" -File -Recurse | Select-Object -First 1
+          if (-not $server) { throw "llama-server.exe absent from checkpoint" }
+          Copy-Item $server.FullName (Join-Path $runtimeDir $server.Name)
+          Get-ChildItem (Join-Path $sourceRoot "build\bin") -Filter "*.dll" -File -Recurse |
+            ForEach-Object { Copy-Item $_.FullName (Join-Path $runtimeDir $_.Name) -Force }
+
+          $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+          $dumpbin = Get-ChildItem (Join-Path $vsRoot "VC\Tools\MSVC") -Filter "dumpbin.exe" -File -Recurse |
+            Where-Object { $_.FullName -match "Hostx64\\x64\\dumpbin\.exe$" } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          $cl = Get-ChildItem (Join-Path $vsRoot "VC\Tools\MSVC") -Filter "cl.exe" -File -Recurse |
+            Where-Object { $_.FullName -match "Hostx64\\x64\\cl\.exe$" } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin -or -not $cl) { throw "Required MSVC tools not found" }
+
+          $crtDirs = Get-ChildItem (Join-Path $vsRoot "VC\Redist\MSVC") -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "x64\Microsoft.VC143.CRT" } |
+            Where-Object { Test-Path $_ }
+          $candidateRoots = @(
+            $env:CUDA_PATH,
+            $env:VCPKG_INSTALLATION_ROOT,
+            "C:\vcpkg",
+            "C:\Program Files\OpenSSL",
+            "C:\Program Files\OpenSSL-Win64",
+            "C:\ProgramData\chocolatey"
+          ) + $crtDirs
+          $candidateRoots = @($candidateRoots | Where-Object { $_ -and (Test-Path $_ -PathType Container) } | Select-Object -Unique)
+
+          function Get-PeDependencies([string] $path) {
+            $lines = & $dumpbin.FullName /nologo /dependents $path 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $path" }
+            @($lines | ForEach-Object {
+              if ($_ -match "^\s+([A-Za-z0-9_.+-]+\.dll)\s*$") { $Matches[1] }
+            } | Sort-Object -Unique)
+          }
+
+          function Find-CandidateDll([string] $name) {
+            foreach ($root in $candidateRoots) {
+              $candidate = Get-ChildItem $root -Filter $name -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($candidate) { return $candidate.FullName }
+            }
+            return $null
+          }
+
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          Get-ChildItem $runtimeDir -File | Where-Object { $_.Extension -in ".exe", ".dll" } |
+            ForEach-Object { $queue.Enqueue($_.FullName) }
+          $inspected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $dependencyRows = [System.Collections.Generic.List[object]]::new()
+
+          while ($queue.Count -gt 0) {
+            $pe = $queue.Dequeue()
+            if (-not $inspected.Add($pe)) { continue }
+            foreach ($dependency in (Get-PeDependencies $pe)) {
+              $packaged = Get-ChildItem $runtimeDir -File | Where-Object { $_.Name -ieq $dependency } | Select-Object -First 1
+              $resolution = "packaged"
+              if (-not $packaged) {
+                if ($dependency -ieq "nvcuda.dll") {
+                  $resolution = "nvidia-display-driver"
+                } elseif (Test-Path (Join-Path "$env:SystemRoot\System32" $dependency)) {
+                  $resolution = "windows-system"
+                } elseif ($dependency -match "^(api-ms-win-|ext-ms-win-)") {
+                  $resolution = "windows-api-set"
+                } else {
+                  $candidate = Find-CandidateDll $dependency
+                  if (-not $candidate) { throw "Unresolved non-system dependency $dependency required by $pe" }
+                  $destination = Join-Path $runtimeDir $dependency
+                  Copy-Item $candidate $destination -Force
+                  $queue.Enqueue($destination)
+                  $resolution = "packaged-from-runtime"
+                }
+              }
+              $dependencyRows.Add([ordered]@{
+                binary = [IO.Path]::GetFileName($pe)
+                dependency = $dependency
+                resolution = $resolution
+              })
+            }
+          }
+
+          $dependencyRows | Sort-Object binary, dependency | ConvertTo-Json -Depth 4 |
+            Set-Content (Join-Path $runtimeDir "RUNTIME_DEPENDENCIES.json") -Encoding utf8NoBOM
+
+          $savedPath = $env:PATH
+          $env:PATH = "$runtimeDir;$env:SystemRoot\System32;$env:SystemRoot"
+          try {
+            $packagedServer = Join-Path $runtimeDir "llama-server.exe"
+            $versionOutput = (& $packagedServer --version 2>&1 | Out-String).Trim()
+            $versionExit = $LASTEXITCODE
+            $helpOutput = (& $packagedServer --help 2>&1 | Out-String).Trim()
+            $helpExit = $LASTEXITCODE
+          } finally { $env:PATH = $savedPath }
+          if ($versionExit -ne 0) { throw "llama-server.exe --version failed: $versionExit`n$versionOutput" }
+          if ($helpExit -ne 0) { throw "llama-server.exe --help failed: $helpExit`n$helpOutput" }
+          $versionOutput | Set-Content (Join-Path $runtimeDir "LLAMA_SERVER_VERSION.txt") -Encoding utf8NoBOM
+          $helpOutput | Set-Content (Join-Path $runtimeDir "LLAMA_SERVER_HELP.txt") -Encoding utf8NoBOM
+
+          $requiredFlags = @("--kv-stream-stage-mib", "--cache-type-k", "--cache-type-v", "--flash-attn", "--ctx-size")
+          $missingFlags = @($requiredFlags | Where-Object { -not $helpOutput.Contains($_) })
+          if ($missingFlags.Count -gt 0) { throw "Required flags absent: $($missingFlags -join ', ')" }
+
+          $runtimeFiles = Get-ChildItem $runtimeDir -File | Where-Object { $_.Extension -in ".exe", ".dll" } | Sort-Object Name
+          $runtimeHashes = @($runtimeFiles | ForEach-Object {
+            [ordered]@{ file = $_.Name; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+          })
+          $preProvenanceFiles = @((Get-ChildItem $runtimeDir -File | Sort-Object Name).Name)
+          $cmakeVersion = (cmake --version | Select-Object -First 1).Trim()
+          $msvcVersion = (& $cl.FullName 2>&1 | Select-String "Compiler Version" | Select-Object -First 1).Line.Trim()
+          $nvccVersion = (& (Join-Path $env:CUDA_PATH "bin\nvcc.exe") --version 2>&1 | Select-String "release" | Select-Object -Last 1).Line.Trim()
+
+          $provenance = [ordered]@{
+            source_repository_url = $env:SOURCE_REPOSITORY
+            source_branch = $env:SOURCE_BRANCH
+            source_commit_sha = $env:SOURCE_COMMIT
+            build_workflow_commit_sha = "c0a12dbf61c04c2494580692d805c941d00a53c8"
+            build_github_actions_run_id = [Int64]$env:BUILD_RUN_ID
+            packaging_workflow_commit_sha = "${{ github.sha }}"
+            packaging_github_actions_run_id = [Int64]"${{ github.run_id }}"
+            windows_runner_image = "windows-2022"
+            runner_image_os = $env:ImageOS
+            runner_image_version = $env:ImageVersion
+            architecture = "x64"
+            cuda_gpu_architecture = "120a-real (NVIDIA compute capability 12.0; GeForce RTX 5080)"
+            cuda_version = $env:CUDA_VERSION
+            cuda_compiler = $nvccVersion
+            cmake_version = $cmakeVersion
+            msvc_version = $msvcVersion
+            cmake_configure_command = 'cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release'
+            cmake_build_command = 'cmake --build build --config Release --target llama-server -j %NUMBER_OF_PROCESSORS%'
+            adaptive_kv_source_unmodified = $true
+            source_changes = @()
+            version_exit_code = $versionExit
+            version_output = $versionOutput
+            help_exit_code = $helpExit
+            adaptive_flag_present = $helpOutput.Contains("--kv-stream-stage-mib")
+            required_flags = [ordered]@{
+              cache_type_k = $helpOutput.Contains("--cache-type-k")
+              cache_type_v = $helpOutput.Contains("--cache-type-v")
+              flash_attention = $helpOutput.Contains("--flash-attn")
+              context_size = $helpOutput.Contains("--ctx-size")
+            }
+            dependency_verification = "recursive dumpbin closure; packaged runtime validated with isolated PATH"
+            packaged_files = @($preProvenanceFiles + "BUILD_PROVENANCE.json" | Sort-Object)
+            runtime_sha256 = $runtimeHashes
+          }
+          $provenance | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $runtimeDir "BUILD_PROVENANCE.json") -Encoding utf8NoBOM
+          Compress-Archive -Path $runtimeDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $zipHash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $($env:PACKAGE_BASENAME).zip" | Set-Content $shaPath -Encoding ascii
+          Write-Host "Validated version output:`n$versionOutput"
+          Write-Host "Validated required flags: $($requiredFlags -join ', ')"
+          Get-ChildItem $runtimeDir -File | Sort-Object Name | Format-Table Name, Length
+          Write-Host "ZIP SHA-256: $zipHash"
+
+      - name: Upload final Windows x64 CUDA package
+        uses: actions/upload-artifact@v6
+        with:
+          name: AXORA_LLAMA_ADAPTIVE_KV_WINDOWS_X64_CUDA_4ba0b9b2
+          path: |
+            AXORA_LLAMA_ADAPTIVE_KV_WINDOWS_X64_CUDA_4ba0b9b2.zip
+            AXORA_LLAMA_ADAPTIVE_KV_WINDOWS_X64_CUDA_4ba0b9b2.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
