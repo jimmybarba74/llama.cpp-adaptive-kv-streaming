@@ -27,7 +27,7 @@ jobs:
   build:
     name: Windows Server 2022 / MSVC / CUDA 13.3 x64
     runs-on: windows-2022
-    timeout-minutes: 600
+    timeout-minutes: 360
 
     steps:
       - name: Checkout pinned Adaptive KV source
@@ -60,10 +60,19 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release
           if errorlevel 1 exit /b %errorlevel%
           cmake --build build --config Release --target llama-server -j %NUMBER_OF_PROCESSORS%
           if errorlevel 1 exit /b %errorlevel%
+
+      - name: Upload compiled runtime checkpoint
+        uses: actions/upload-artifact@v6
+        with:
+          name: axora-compiled-runtime-${{ github.run_id }}
+          path: build/bin
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
       - name: Package verified runtime and provenance
         shell: pwsh
@@ -105,7 +114,12 @@ jobs:
             Sort-Object Name -Descending |
             ForEach-Object { Join-Path $_.FullName "x64\Microsoft.VC143.CRT" } |
             Where-Object { Test-Path $_ }
-          $candidateDirs = @((Join-Path $env:CUDA_PATH "bin")) + $crtDirs
+          $candidateDirs = @(
+            (Join-Path $env:CUDA_PATH "bin"),
+            (Join-Path $env:CUDA_PATH "bin\x64"),
+            (Join-Path $env:CUDA_PATH "lib")
+          ) + $crtDirs
+          $candidateDirs = @($candidateDirs | Where-Object { Test-Path $_ -PathType Container })
 
           function Get-PeDependencies([string] $path) {
             $lines = & $dumpbin.FullName /nologo /dependents $path 2>&1
@@ -120,6 +134,9 @@ jobs:
               $candidate = Join-Path $dir $name
               if (Test-Path $candidate -PathType Leaf) { return $candidate }
             }
+            $recursiveCandidate = Get-ChildItem $env:CUDA_PATH -Filter $name -File -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($recursiveCandidate) { return $recursiveCandidate.FullName }
             return $null
           }
 
@@ -222,12 +239,12 @@ jobs:
             runner_image_os = $env:ImageOS
             runner_image_version = $env:ImageVersion
             architecture = "x64"
-            cuda_gpu_architecture = "120 (NVIDIA compute capability 12.0; GeForce RTX 5080)"
+            cuda_gpu_architecture = "120a-real (NVIDIA compute capability 12.0; GeForce RTX 5080)"
             cuda_version = $env:CUDA_VERSION
             cuda_compiler = $nvccVersion
             cmake_version = $cmakeVersion
             msvc_version = $msvcVersion
-            cmake_configure_command = 'cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release'
+            cmake_configure_command = 'cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release'
             cmake_build_command = 'cmake --build build --config Release --target llama-server -j %NUMBER_OF_PROCESSORS%'
             build_timestamp_utc = (Get-Date).ToUniversalTime().ToString("o")
             adaptive_kv_source_unmodified = $true
