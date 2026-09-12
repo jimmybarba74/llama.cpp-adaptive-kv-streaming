@@ -27,7 +27,7 @@ jobs:
   build:
     name: Windows Server 2022 / MSVC / CUDA 13.3 x64
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 600
 
     steps:
       - name: Checkout pinned Adaptive KV source
