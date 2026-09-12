@@ -27,7 +27,7 @@ jobs:
   build:
     name: Windows Server 2022 / MSVC / CUDA 13.3 x64
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout pinned Adaptive KV source
@@ -60,7 +60,7 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release
           if errorlevel 1 exit /b %errorlevel%
           cmake --build build --config Release --target llama-server -j %NUMBER_OF_PROCESSORS%
           if errorlevel 1 exit /b %errorlevel%
@@ -222,11 +222,12 @@ jobs:
             runner_image_os = $env:ImageOS
             runner_image_version = $env:ImageVersion
             architecture = "x64"
+            cuda_gpu_architecture = "120 (NVIDIA compute capability 12.0; GeForce RTX 5080)"
             cuda_version = $env:CUDA_VERSION
             cuda_compiler = $nvccVersion
             cmake_version = $cmakeVersion
             msvc_version = $msvcVersion
-            cmake_configure_command = 'cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release'
+            cmake_configure_command = 'cmake -S . -B build -G "Ninja" -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release'
             cmake_build_command = 'cmake --build build --config Release --target llama-server -j %NUMBER_OF_PROCESSORS%'
             build_timestamp_utc = (Get-Date).ToUniversalTime().ToString("o")
             adaptive_kv_source_unmodified = $true
