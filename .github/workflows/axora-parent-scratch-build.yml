@@ -1,0 +1,256 @@
+name: AXORA Parent Scratch Windows CUDA Build
+
+on:
+  pull_request:
+    branches:
+      - axora-build-base-20260919
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 600
+    env:
+      BASE_SHA: 4ba0b9b25ffdafe2ec376e32a641ef229e457bae
+      FINAL_ZIP: AXORA_PARENT_SCRATCH_V1_WIN_X64_CUDA_BUILD.zip
+
+    steps:
+      - name: Checkout exact pull request head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install CUDA 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: x64
+
+      - name: Configure build environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (-not $vsRoot) { throw 'Visual Studio 2022 with C++ tools not found' }
+          "VS_ROOT=$vsRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $cl -or -not $dumpbin) { throw 'MSVC cl.exe or dumpbin.exe not found' }
+          "CL_EXE=$($cl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DUMPBIN_EXE=$($dumpbin.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify source patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse $env:BASE_SHA).Trim()
+          if ($head -ne $env:BASE_SHA) { throw "Required base commit unavailable: $head" }
+          python .axora-build/VERIFY_AXORA_PARENT_SCRATCH_V1.py .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check $env:BASE_SHA -- src/llama-context.cpp src/llama-kv-cache.cpp src/llama-kv-cache.h tools/server/server-context.cpp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure and build Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $PWD 'BUILD_LOG.txt'
+          @(
+            'AXORA Parent/Scratch V1 Windows x64 CUDA build log',
+            "BASE_COMMIT=$env:BASE_SHA",
+            'SUPPLIED_PATCHER_FIRST_ATTEMPT_EXIT=1 (ambiguous duplicate prototype match)',
+            'PATCHER_MECHANICAL_ANCHOR_DISAMBIGUATION_EXIT=0',
+            'VERIFIER_EXIT=0',
+            'GIT_DIFF_CHECK_EXIT=0',
+            '',
+            'CMake:',
+            (cmake --version | Out-String).Trim(),
+            '',
+            'MSVC:',
+            ((& $env:CL_EXE 2>&1 | Out-String).Trim()),
+            '',
+            'CUDA Toolkit:',
+            ((nvcc --version 2>&1 | Out-String).Trim()),
+            '',
+            'CONFIGURE COMMAND:',
+            'cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a-real -DLLAMA_LLGUIDANCE=OFF -DLLAMA_BUILD_TESTS=ON'
+          ) | Set-Content -Path $log -Encoding utf8
+
+          & cmake -S . -B build -G 'Visual Studio 17 2022' -A x64 `
+            -DGGML_CUDA=ON `
+            -DGGML_CUDA_FA_ALL_QUANTS=ON `
+            -DCMAKE_CUDA_ARCHITECTURES=120a-real `
+            -DLLAMA_LLGUIDANCE=OFF `
+            -DLLAMA_BUILD_TESTS=ON *>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          'BUILD COMMAND: cmake --build build --config Release --target llama-server test-kv-stream-config test-arg-parser --parallel' | Add-Content $log
+          & cmake --build build --config Release --target llama-server test-kv-stream-config test-arg-parser --parallel *>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test and package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $PWD 'package/AXORA_PARENT_SCRATCH_V1_WIN_X64_CUDA_BUILD'
+          $runtime = Join-Path $root 'runtime'
+          New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+
+          $bin = Join-Path $PWD 'build/bin/Release'
+          $server = Join-Path $bin 'llama-server.exe'
+          $kvTest = Join-Path $bin 'test-kv-stream-config.exe'
+          $argTest = Join-Path $bin 'test-arg-parser.exe'
+          foreach ($required in @($server, $kvTest, $argTest)) {
+            if (-not (Test-Path $required)) { throw "Required executable missing: $required" }
+          }
+
+          $testLog = Join-Path $root 'TEST_LOG.txt'
+          @(
+            'STATIC PATCH VERIFIER: exit 0',
+            'git diff --check: exit 0',
+            ''
+          ) | Set-Content -Path $testLog -Encoding utf8
+
+          function Run-Test([string]$name, [string]$path) {
+            "TEST: $name" | Add-Content $testLog
+            & $path *>&1 | Tee-Object -FilePath $testLog -Append
+            $code = $LASTEXITCODE
+            "EXIT_CODE=$code" | Add-Content $testLog
+            '' | Add-Content $testLog
+            if ($code -ne 0) { throw "$name failed with exit code $code" }
+          }
+          Run-Test 'test-kv-stream-config' $kvTest
+          Run-Test 'test-arg-parser' $argTest
+
+          & $server --version *>&1 | Set-Content -Path (Join-Path $root 'SERVER_VERSION.txt') -Encoding utf8
+          $versionExit = $LASTEXITCODE
+          if ($versionExit -ne 0) { throw "llama-server --version failed: $versionExit" }
+          & $server --help *>&1 | Set-Content -Path (Join-Path $root 'SERVER_HELP.txt') -Encoding utf8
+          $helpExit = $LASTEXITCODE
+          if ($helpExit -ne 0) { throw "llama-server --help failed: $helpExit" }
+          $helpText = Get-Content (Join-Path $root 'SERVER_HELP.txt') -Raw
+          if ($helpText -notmatch '--kv-stream-stage-mib') { throw '--kv-stream-stage-mib missing from llama-server --help' }
+
+          Copy-Item $server $runtime
+          Get-ChildItem $bin -Filter '*.dll' -File | Copy-Item -Destination $runtime
+
+          $redistRoot = Join-Path $env:VS_ROOT 'VC/Redist/MSVC'
+          $redistDir = Get-ChildItem $redistRoot -Directory | Sort-Object Name -Descending | ForEach-Object {
+            Join-Path $_.FullName 'x64/Microsoft.VC143.CRT'
+          } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($redistDir) { Get-ChildItem $redistDir -Filter '*.dll' -File | Copy-Item -Destination $runtime -Force }
+
+          $searchDirs = @($bin, (Join-Path $env:CUDA_PATH 'bin'), $redistDir) | Where-Object { $_ -and (Test-Path $_) }
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          Get-ChildItem $runtime -File | Where-Object { $_.Extension -in '.exe', '.dll' } | ForEach-Object { $queue.Enqueue($_.FullName) }
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          while ($queue.Count -gt 0) {
+            $item = $queue.Dequeue()
+            if (-not $seen.Add((Split-Path $item -Leaf))) { continue }
+            $deps = & $env:DUMPBIN_EXE /DEPENDENTS $item 2>$null | ForEach-Object {
+              if ($_ -match '^\s+([A-Za-z0-9._-]+\.dll)\s*$') { $Matches[1] }
+            }
+            foreach ($dep in $deps) {
+              $dest = Join-Path $runtime $dep
+              if (Test-Path $dest) { continue }
+              $found = $null
+              foreach ($dir in $searchDirs) {
+                $candidate = Join-Path $dir $dep
+                if (Test-Path $candidate) { $found = $candidate; break }
+              }
+              if ($found) {
+                Copy-Item $found $dest
+                $queue.Enqueue($dest)
+              }
+            }
+          }
+
+          $savedPath = $env:PATH
+          $env:PATH = "$runtime;$env:WINDIR\System32;$env:WINDIR"
+          & (Join-Path $runtime 'llama-server.exe') --version *>&1 | Add-Content $testLog
+          $runtimeExit = $LASTEXITCODE
+          $env:PATH = $savedPath
+          "SELF_CONTAINED_RUNTIME_VERSION_EXIT_CODE=$runtimeExit" | Add-Content $testLog
+          if ($runtimeExit -ne 0) { throw "Packaged runtime dependency check failed: $runtimeExit" }
+
+          $env:BASE_SHA | Set-Content -Path (Join-Path $root 'SOURCE_BASE_COMMIT.txt') -Encoding ascii -NoNewline
+          Copy-Item '.axora-build/CHATGPT_PATCH.diff' (Join-Path $root 'CHATGPT_PATCH.diff')
+          git diff $env:BASE_SHA -- src/llama-context.cpp src/llama-kv-cache.cpp src/llama-kv-cache.h tools/server/server-context.cpp | Set-Content -Path (Join-Path $root 'FINAL_SOURCE.diff') -Encoding utf8
+          Copy-Item '.axora-build/WORK_MECHANICAL_FIXES.diff' (Join-Path $root 'WORK_MECHANICAL_FIXES.diff')
+          Copy-Item 'BUILD_LOG.txt' (Join-Path $root 'BUILD_LOG.txt')
+          Copy-Item '.axora-build/DESIGN_FREEZE.md' (Join-Path $root 'DESIGN_FREEZE.md')
+
+          $runtimeHashes = @{}
+          Get-ChildItem $runtime -File | Sort-Object Name | ForEach-Object {
+            $runtimeHashes[$_.Name] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $cmakeVersion = ((cmake --version | Select-Object -First 1) -replace '^cmake version\s+', '').Trim()
+          $cudaVersionLine = (nvcc --version | Select-String 'release').Line.Trim()
+          $msvcLine = ((& $env:CL_EXE 2>&1 | Select-Object -First 1) | Out-String).Trim()
+          $receipt = [ordered]@{
+            verdict = 'BUILD_PASS_AWAITING_GPU_QUALIFICATION'
+            exact_base_commit = $env:BASE_SHA
+            compiler = $msvcLine
+            cmake_version = $cmakeVersion
+            cuda_toolkit = $cudaVersionLine
+            cuda_architecture = '120a-real'
+            cmake_flags = @(
+              'GGML_CUDA=ON',
+              'GGML_CUDA_FA_ALL_QUANTS=ON',
+              'CMAKE_CUDA_ARCHITECTURES=120a-real',
+              'LLAMA_LLGUIDANCE=OFF',
+              'LLAMA_BUILD_TESTS=ON'
+            )
+            supplied_patcher_first_attempt_exit_status = 1
+            patcher_mechanical_anchor_disambiguation_exit_status = 0
+            verifier_exit_status = 0
+            git_diff_check_status = 0
+            build_status = 0
+            tests = @(
+              [ordered]@{ name = 'test-kv-stream-config'; exit_code = 0 },
+              [ordered]@{ name = 'test-arg-parser'; exit_code = 0 },
+              [ordered]@{ name = 'llama-server --version'; exit_code = $versionExit },
+              [ordered]@{ name = 'llama-server --help'; exit_code = $helpExit },
+              [ordered]@{ name = 'help contains --kv-stream-stage-mib'; exit_code = 0 },
+              [ordered]@{ name = 'packaged runtime --version with isolated PATH'; exit_code = $runtimeExit }
+            )
+            mechanical_fix = [ordered]@{
+              source_changes = @()
+              patcher_application = 'Disambiguated one duplicated header prototype by extending the exact-match anchor with its neighboring slot_info declarations; generated C++ replacement unchanged.'
+            }
+            runtime_sha256 = $runtimeHashes
+            FUNCTIONAL_GPU_QUALIFICATION = 'NOT_PERFORMED'
+          }
+          $receipt | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $root 'AXORA_PARENT_SCRATCH_V1_BUILD_RECEIPT.json') -Encoding utf8
+
+          $sumLines = Get-ChildItem $root -File -Recurse | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object FullName | ForEach-Object {
+            $rel = [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $rel"
+          }
+          $sumLines | Set-Content -Path (Join-Path $root 'SHA256SUMS.txt') -Encoding ascii
+
+          Compress-Archive -Path "$root\*" -DestinationPath $env:FINAL_ZIP -CompressionLevel Optimal
+          if (-not (Test-Path $env:FINAL_ZIP)) { throw 'Final ZIP was not created' }
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: axora-parent-scratch-final
+          path: AXORA_PARENT_SCRATCH_V1_WIN_X64_CUDA_BUILD.zip
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axora-parent-scratch-diagnostics
+          path: |
+            BUILD_LOG.txt
+            package/**/TEST_LOG.txt
+          if-no-files-found: warn
+          retention-days: 7
